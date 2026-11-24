@@ -15,6 +15,59 @@ const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const sessionsByToken = new Map(); // resumeToken -> Session
 const roomsByCode = new Map();     // code -> Room
 const matchesById = new Map();     // matchId -> Match
+const queuesByMode = new Map();    // mode -> Set<Session>
+
+let countsBroadcastTimer = null;
+let lastCountsJson = "";
+
+function computeModeCounts() {
+  const counts = {};
+  for (const [mode, set] of queuesByMode) {
+    if (set.size > 0) {
+      counts[mode] = (counts[mode] || 0) + set.size;
+    }
+  }
+  for (const match of matchesById.values()) {
+    if (!match.finished) {
+      counts[match.mode] = (counts[match.mode] || 0) + match.players.length;
+    }
+  }
+  return counts;
+}
+
+function sendModeCounts(ws) {
+  send(ws, { type: "mode_counts", counts: computeModeCounts() });
+}
+
+function scheduleModeCountsBroadcast() {
+  if (countsBroadcastTimer) return;
+  countsBroadcastTimer = setTimeout(() => {
+    countsBroadcastTimer = null;
+    const payload = JSON.stringify({ type: "mode_counts", counts: computeModeCounts() });
+    if (payload === lastCountsJson) return;
+    lastCountsJson = payload;
+    for (const client of wss.clients) {
+      if (client.readyState === client.OPEN) {
+        client.send(payload);
+      }
+    }
+  }, 1500);
+}
+
+function leaveQueue(session, notify = true) {
+  if (!session || !session.queuedMode) return;
+  const mode = session.queuedMode;
+  session.queuedMode = null;
+  const set = queuesByMode.get(mode);
+  if (set) {
+    set.delete(session);
+    if (set.size === 0) queuesByMode.delete(mode);
+  }
+  if (notify) {
+    send(session.ws, { type: "queue_state", inQueue: false, queueSize: 0, mode: "" });
+  }
+  scheduleModeCountsBroadcast();
+}
 
 function send(ws, obj) {
   if (ws && ws.readyState === ws.OPEN) {
@@ -93,16 +146,16 @@ function leaveRoom(session) {
   }
 }
 
-function startMatchFromRoom(room) {
+function startMatch(mode, playerSessions, roomCode = null) {
   const matchId = randomUUID();
   const overworldSeed = generateSeed();
   const match = {
     id: matchId,
-    roomCode: room.code,
-    mode: room.mode,
-    lastStanding: room.mode === "time_trial",
+    roomCode,
+    mode,
+    lastStanding: mode === "time_trial",
     overworldSeed,
-    players: room.players.map((p) => p.session),
+    players: playerSessions,
     loaded: new Set(),
     results: new Map(), // uuid -> { name, time, status, forfeited }
     startedAt: 0,
@@ -122,7 +175,12 @@ function startMatchFromRoom(room) {
       opponents,
     });
   }
-  console.log(`[match] ${matchId} assigned (${match.mode}, seed=${overworldSeed}, room=${room.code})`);
+  scheduleModeCountsBroadcast();
+  console.log(`[match] ${matchId} assigned (${match.mode}, seed=${overworldSeed}, room=${roomCode ?? "queue"})`);
+}
+
+function startMatchFromRoom(room) {
+  startMatch(room.mode, room.players.map((p) => p.session), room.code);
 }
 
 function formatMs(ms) {
@@ -180,13 +238,16 @@ function finishMatch(match, winnerName, standings, winnerTime = 0) {
   }
 
   // Keep the room alive for the next round with ready flags reset
-  const room = roomsByCode.get(match.roomCode);
-  if (room) {
-    for (const p of room.players) {
-      p.ready = false;
+  if (match.roomCode) {
+    const room = roomsByCode.get(match.roomCode);
+    if (room) {
+      for (const p of room.players) {
+        p.ready = false;
+      }
+      broadcastRoom(room);
     }
-    broadcastRoom(room);
   }
+  scheduleModeCountsBroadcast();
 
   console.log(`[match] ${match.id} finished — winner=${winnerName ?? "DRAW"} (${finishTime}ms)`);
 }
@@ -259,10 +320,12 @@ wss.on("connection", (ws) => {
         uuid: verified.uuid,
         resumeToken,
         roomCode: null,
+        queuedMode: null,
         matchId: null,
       };
       sessionsByToken.set(resumeToken, session);
       send(ws, { type: "login_ok", name: session.name, uuid: session.uuid, resumeToken });
+      sendModeCounts(ws);
       console.log(`[auth] ${session.name} logged in`);
       return;
     }
@@ -277,6 +340,7 @@ wss.on("connection", (ws) => {
       existing.ws = ws;
       session = existing;
       send(ws, { type: "login_ok", name: session.name, uuid: session.uuid, resumeToken: session.resumeToken });
+      sendModeCounts(ws);
       return;
     }
 
@@ -288,6 +352,43 @@ wss.on("connection", (ws) => {
 
     // --- Presence ---
     if (type === "activity") {
+      return;
+    }
+
+    // --- Matchmaking Queue ---
+    if (type === "queue_join") {
+      const mode = typeof msg.mode === "string" && msg.mode.trim() ? msg.mode.trim() : "time_trial";
+      leaveRoom(session);
+      leaveQueue(session, false);
+      let set = queuesByMode.get(mode);
+      if (!set) {
+        set = new Set();
+        queuesByMode.set(mode, set);
+      }
+      set.add(session);
+      session.queuedMode = mode;
+      send(ws, { type: "queue_state", inQueue: true, queueSize: set.size, mode });
+      scheduleModeCountsBroadcast();
+
+      if (set.size >= 2) {
+        const pair = [];
+        for (const s of set) {
+          pair.push(s);
+          if (pair.length === 2) break;
+        }
+        for (const s of pair) {
+          set.delete(s);
+          s.queuedMode = null;
+          send(s.ws, { type: "queue_state", inQueue: false, queueSize: 0, mode: "" });
+        }
+        if (set.size === 0) queuesByMode.delete(mode);
+        startMatch(mode, pair, null);
+      }
+      return;
+    }
+
+    if (type === "queue_leave") {
+      leaveQueue(session, true);
       return;
     }
 
@@ -371,13 +472,8 @@ wss.on("connection", (ws) => {
     if (type === "room_ready") {
       if (!session.roomCode) return;
       const room = roomsByCode.get(session.roomCode);
-      if (!room) return;
-      const slot = room.players.find((p) => p.session === session);
-      if (!slot) return;
-      slot.ready = !slot.ready;
-      broadcastRoom(room);
-
-      if (room.players.length === 2 && room.players.every((p) => p.ready)) {
+      if (!room || room.owner !== session.name) return;
+      if (room.players.length >= 2) {
         startMatchFromRoom(room);
       }
       return;
@@ -461,6 +557,7 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     if (!session || session.ws !== ws) return;
+    leaveQueue(session, false);
     leaveRoom(session);
     if (session.matchId) {
       const match = matchesById.get(session.matchId);
