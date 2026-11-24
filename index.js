@@ -1,10 +1,23 @@
 import { createServer } from "node:http";
 import { randomBytes, randomUUID } from "node:crypto";
 import { WebSocketServer } from "ws";
+import { SeedProvider } from "./seeds/seedProvider.js";
+import { ProfileStore } from "./profiles/profileStore.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || "0.0.0.0";
-const SERVER_VERSION = "0.1.0";
+const SEEDS_DIR = process.env.SEEDS_DIR || "./data/seeds";
+const PROFILES_DB = process.env.PROFILES_DB || "./data/profiles.db";
+const SERVER_VERSION = "0.2.0";
+
+const seedProvider = new SeedProvider(SEEDS_DIR);
+seedProvider.init();
+const profileStore = new ProfileStore(PROFILES_DB);
+profileStore.init();
+process.on("SIGHUP", () => {
+  console.log("[seeds] SIGHUP received — reloading SQLite seed packs...");
+  seedProvider.reload();
+});
 const MAX_PAYLOAD_BYTES = 8 * 1024;
 const RATE_LIMIT_WINDOW_MS = 1000;
 const RATE_LIMIT_MAX_MSGS = 30;
@@ -91,13 +104,6 @@ function generateRoomCode() {
   return randomBytes(3).toString("hex").toUpperCase();
 }
 
-function generateSeed() {
-  // Signed 64-bit integer safe for JS Number (53-bit)
-  const buf = randomBytes(6);
-  const val = buf.readUIntBE(0, 6);
-  return Math.random() < 0.5 ? -val : val;
-}
-
 /**
  * Strict Mojang session verification (no offline accounts allowed).
  */
@@ -122,7 +128,11 @@ function broadcastRoom(room) {
     code: room.code,
     mode: room.mode,
     owner: room.owner,
-    players: room.players.map((p) => ({ name: p.name, ready: p.ready })),
+    players: room.players.map((p) => ({
+      name: p.name,
+      ready: p.ready,
+      cosmetics: p.session.cosmetics || {},
+    })),
   };
   for (const p of room.players) {
     send(p.session.ws, payload);
@@ -148,16 +158,19 @@ function leaveRoom(session) {
 
 function startMatch(mode, playerSessions, roomCode = null) {
   const matchId = randomUUID();
-  const overworldSeed = generateSeed();
+  const { overworldSeed, netherSeed, endSeed, types } = seedProvider.pickMatchSeeds(mode);
   const match = {
     id: matchId,
     roomCode,
     mode,
     lastStanding: mode === "time_trial",
+    scoreMode: mode === "craft_random_item",
     overworldSeed,
+    netherSeed,
+    endSeed,
     players: playerSessions,
     loaded: new Set(),
-    results: new Map(), // uuid -> { name, time, status, forfeited }
+    results: new Map(), // uuid -> { name, time, score, status, forfeited }
     startedAt: 0,
     finished: false,
   };
@@ -165,18 +178,28 @@ function startMatch(mode, playerSessions, roomCode = null) {
 
   for (const s of match.players) {
     s.matchId = matchId;
-    const opponents = match.players.filter((o) => o !== s).map((o) => o.name);
+    const opponentSessions = match.players.filter((o) => o !== s);
+    const opponents = opponentSessions.map((o) => o.name);
+    const opponentProfiles = {};
+    for (const o of opponentSessions) {
+      opponentProfiles[o.name] = o.cosmetics || {};
+    }
     send(s.ws, {
       type: "match_assigned",
       matchId,
       overworldSeed,
+      netherSeed,
+      endSeed,
       startsAt: 0,
       mode: match.mode,
       opponents,
+      opponentProfiles,
     });
   }
   scheduleModeCountsBroadcast();
-  console.log(`[match] ${matchId} assigned (${match.mode}, seed=${overworldSeed}, room=${roomCode ?? "queue"})`);
+  console.log(
+    `[match] ${matchId} assigned (${match.mode}, ow=${overworldSeed}[${types.overworld}], nether=${netherSeed}[${types.nether}], end=${endSeed}[${types.end}], room=${roomCode ?? "queue"})`
+  );
 }
 
 function startMatchFromRoom(room) {
@@ -202,6 +225,8 @@ function maybeCompleteMatch(match) {
 
   const standings = Array.from(match.results.values()).sort((a, b) => {
     if (a.forfeited !== b.forfeited) return a.forfeited ? 1 : -1;
+    // Score modes (e.g. craft_random_item): highest crafted item count wins
+    if (match.scoreMode) return b.score - a.score;
     // Time Trial: longest survival time wins; race modes: fastest time wins
     return match.lastStanding ? b.time - a.time : a.time - b.time;
   });
@@ -214,7 +239,7 @@ function maybeCompleteMatch(match) {
   finishMatch(
     match,
     winner ? winner.name : null,
-    standings.map(({ name, time, status }) => ({ name, time, status })),
+    standings.map(({ name, time, score, status }) => ({ name, time, score, status })),
     winner ? winner.time : 0
   );
 }
@@ -252,13 +277,62 @@ function finishMatch(match, winnerName, standings, winnerTime = 0) {
   console.log(`[match] ${match.id} finished — winner=${winnerName ?? "DRAW"} (${finishTime}ms)`);
 }
 
-// HTTP server (simple health check + WS upgrade)
+// HTTP server (health check, public read-only profile API, + WS upgrade)
 const httpServer = createServer((req, res) => {
-  if (req.url === "/health") {
+  const parsedUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const pathname = parsedUrl.pathname;
+
+  if (req.method === "GET" && pathname === "/health") {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, rooms: roomsByCode.size, matches: matchesById.size }));
+    res.end(JSON.stringify({
+      ok: true,
+      rooms: roomsByCode.size,
+      matches: matchesById.size,
+      profiles: profileStore.getCount(),
+      seeds: seedProvider.getStats(),
+    }));
     return;
   }
+
+  // Batch lookup: GET /api/profiles?names=Alice,Bob or ?uuids=...
+  if (req.method === "GET" && pathname === "/api/profiles") {
+    const namesParam = parsedUrl.searchParams.get("names");
+    const uuidsParam = parsedUrl.searchParams.get("uuids");
+    const profiles = namesParam
+      ? profileStore.getManyByNames(namesParam.split(","))
+      : uuidsParam
+        ? profileStore.getManyByUuids(uuidsParam.split(","))
+        : {};
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "cache-control": "public, max-age=30",
+      "access-control-allow-origin": "*",
+    });
+    res.end(JSON.stringify({ profiles }));
+    return;
+  }
+
+  // Single lookup: GET /api/profiles/<uuid-or-username>
+  if (req.method === "GET" && pathname.startsWith("/api/profiles/")) {
+    const id = decodeURIComponent(pathname.slice("/api/profiles/".length));
+    const profile = profileStore.getByIdentifier(id);
+    if (!profile) {
+      res.writeHead(404, {
+        "content-type": "application/json",
+        "access-control-allow-origin": "*",
+      });
+      res.end(JSON.stringify({ error: "profile_not_found" }));
+      return;
+    }
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "cache-control": "public, max-age=30",
+      "access-control-allow-origin": "*",
+    });
+    res.end(JSON.stringify(profile));
+    return;
+  }
+
   res.writeHead(404);
   res.end();
 });
@@ -313,18 +387,26 @@ wss.on("connection", (ws) => {
         sendError(ws, "auth_failed", "Mojang authentication failed. Offline accounts are not allowed.");
         return;
       }
+      const profile = profileStore.ensureProfile(verified.uuid, verified.name);
       const resumeToken = randomBytes(24).toString("hex");
       session = {
         ws,
         name: verified.name,
         uuid: verified.uuid,
+        cosmetics: profile.cosmetics,
         resumeToken,
         roomCode: null,
         queuedMode: null,
         matchId: null,
       };
       sessionsByToken.set(resumeToken, session);
-      send(ws, { type: "login_ok", name: session.name, uuid: session.uuid, resumeToken });
+      send(ws, {
+        type: "login_ok",
+        name: session.name,
+        uuid: session.uuid,
+        resumeToken,
+        cosmetics: session.cosmetics,
+      });
       sendModeCounts(ws);
       console.log(`[auth] ${session.name} logged in`);
       return;
@@ -339,7 +421,13 @@ wss.on("connection", (ws) => {
       }
       existing.ws = ws;
       session = existing;
-      send(ws, { type: "login_ok", name: session.name, uuid: session.uuid, resumeToken: session.resumeToken });
+      send(ws, {
+        type: "login_ok",
+        name: session.name,
+        uuid: session.uuid,
+        resumeToken: session.resumeToken,
+        cosmetics: session.cosmetics || {},
+      });
       sendModeCounts(ws);
       return;
     }
@@ -347,6 +435,18 @@ wss.on("connection", (ws) => {
     // All remaining messages require an authenticated session
     if (!session) {
       sendError(ws, "unauthenticated", "Please log in first.");
+      return;
+    }
+
+    // --- Profile customization update ---
+    if (type === "profile_update") {
+      const updated = profileStore.updateCosmetics(session.uuid, session.name, msg.cosmetics);
+      session.cosmetics = updated.cosmetics;
+      send(ws, { type: "profile_ok", cosmetics: updated.cosmetics, updatedAt: updated.updatedAt });
+      if (session.roomCode) {
+        const room = roomsByCode.get(session.roomCode);
+        if (room) broadcastRoom(room);
+      }
       return;
     }
 
@@ -521,16 +621,18 @@ wss.on("connection", (ws) => {
       if (match.results.has(session.uuid)) return;
       const elapsed = match.startedAt > 0 ? Math.max(0, Date.now() - match.startedAt) : 0;
 
+      const score = match.scoreMode ? (Number.isFinite(Number(msg.score)) ? Number(msg.score) : 0) : -1;
       match.results.set(session.uuid, {
         name: session.name,
         time: elapsed,
-        status: match.lastStanding ? "Time's Up" : "Finished",
+        score,
+        status: match.lastStanding || match.scoreMode ? "Time's Up" : "Finished",
         forfeited: false,
       });
 
       if (match.lastStanding) {
         broadcastMatchNotice(match, `${session.name} ran out of time at ${formatMs(elapsed)}!`);
-      } else {
+      } else if (!match.scoreMode) {
         broadcastMatchNotice(match, `${session.name} finished in ${formatMs(elapsed)}!`);
       }
 

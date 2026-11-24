@@ -29,9 +29,10 @@ cd "$APP_DIR"
 if [ -d ".git" ]; then
   git fetch origin main
   git reset --hard origin/main
-  # Remove untracked/old files while keeping .env
-  git clean -fd -e .env
+  # Remove untracked/old files while keeping .env and SQLite seed packs in data/
+  git clean -fd -e .env -e data
 fi
+mkdir -p "$APP_DIR/data/seeds"
 
 echo "==> [3/6] Configuring .env..."
 if [ -n "${PORT:-}" ]; then
@@ -49,9 +50,10 @@ fi
 ACTIVE_PORT="$(grep -E '^PORT=' "$ENV_FILE" | tail -n1 | cut -d= -f2- | tr -d '[:space:]')"
 ACTIVE_PORT="${ACTIVE_PORT:-$DEFAULT_PORT}"
 
-echo "==> [4/6] Installing production dependencies..."
+echo "==> [4/6] Installing production dependencies & building seed DBs..."
 rm -rf "$APP_DIR/node_modules"
 npm ci --omit=dev
+node "$APP_DIR/seeds/build-all.js" "$APP_DIR/seed-lists" "$APP_DIR/data/seeds"
 
 echo "==> [5/6] Installing/updating systemd service ($SERVICE_NAME)..."
 NODE_BIN="$(command -v node)"
@@ -68,6 +70,7 @@ User=${RUN_USER}
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=-${ENV_FILE}
 ExecStart=${NODE_BIN} ${APP_DIR}/index.js
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=3
 
