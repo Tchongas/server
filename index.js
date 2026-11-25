@@ -294,6 +294,19 @@ const httpServer = createServer((req, res) => {
     return;
   }
 
+  // Public seed fetch for Singleplayer runs: GET /api/seeds/next?mode=time_trial
+  if (req.method === "GET" && pathname === "/api/seeds/next") {
+    const mode = parsedUrl.searchParams.get("mode") || "time_trial";
+    const picked = seedProvider.pickMatchSeeds(mode);
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "access-control-allow-origin": "*",
+    });
+    res.end(JSON.stringify(picked));
+    return;
+  }
+
   // Batch lookup: GET /api/profiles?names=Alice,Bob or ?uuids=...
   if (req.method === "GET" && pathname === "/api/profiles") {
     const namesParam = parsedUrl.searchParams.get("names");
