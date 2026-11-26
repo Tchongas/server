@@ -29,8 +29,8 @@ cd "$APP_DIR"
 if [ -d ".git" ]; then
   git fetch origin main
   git reset --hard origin/main
-  # Remove untracked/old files while keeping .env and SQLite seed packs in data/
-  git clean -fd -e .env -e data
+  # Remove untracked/old files while keeping .env, SQLite seed packs in data/, and uploaded releases/
+  git clean -fd -e .env -e data -e releases
 fi
 mkdir -p "$APP_DIR/data/seeds"
 

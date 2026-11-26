@@ -1,22 +1,109 @@
+import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { createServer } from "node:http";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 import { SeedProvider } from "./seeds/seedProvider.js";
 import { ProfileStore } from "./profiles/profileStore.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function loadModeFlags() {
+  const flags = new Map([
+    ["time_trial", { lastStanding: true, scoreMode: false }],
+    ["craft_random_item", { lastStanding: false, scoreMode: true }],
+  ]);
+  const candidates = [
+    process.env.MODES_CONFIG,
+    resolve(__dirname, "./modes.json"),
+    resolve(__dirname, "../src/main/resources/timetrials_modes.json"),
+  ].filter(Boolean);
+  for (const filePath of candidates) {
+    if (!existsSync(filePath)) continue;
+    try {
+      const cfg = JSON.parse(readFileSync(filePath, "utf8"));
+      if (Array.isArray(cfg?.modes)) {
+        for (const m of cfg.modes) {
+          if (!m || typeof m.id !== "string") continue;
+          const id = m.id.trim();
+          const scoreMode = String(m.resultType || "").toUpperCase() === "SCORE"
+            || String(m.tabListType || "").toUpperCase() === "SCORE";
+          const lastStanding = !scoreMode && String(m.tabListType || "").toUpperCase() === "REMAINING_TIME";
+          flags.set(id, { lastStanding, scoreMode });
+        }
+        console.log(`[modes] loaded ${flags.size} mode definitions from ${filePath}`);
+      }
+      break;
+    } catch (err) {
+      console.warn(`[modes] failed to parse ${filePath}:`, err.message);
+    }
+  }
+  return flags;
+}
+
+const MODE_FLAGS = loadModeFlags();
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || "0.0.0.0";
 const SEEDS_DIR = process.env.SEEDS_DIR || "./data/seeds";
 const PROFILES_DB = process.env.PROFILES_DB || "./data/profiles.db";
+const RELEASES_DIR = resolve(process.env.RELEASES_DIR || resolve(__dirname, "./releases"));
 const SERVER_VERSION = "0.2.0";
+
+function loadReleaseInfo() {
+  const manifestPath = resolve(RELEASES_DIR, "release.json");
+  if (!existsSync(manifestPath)) {
+    return null;
+  }
+  try {
+    const raw = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const version = typeof raw.version === "string" ? raw.version.trim() : "";
+    if (!version) return null;
+
+    const externalUrl = typeof raw.downloadUrl === "string" && raw.downloadUrl.trim() ? raw.downloadUrl.trim() : "";
+    const file = typeof raw.file === "string" ? raw.file.trim() : "";
+    const jarPath = file ? resolve(RELEASES_DIR, file) : "";
+
+    let sha256 = typeof raw.sha256 === "string" ? raw.sha256.trim() : "";
+    let size = 0;
+    let hasLocalJar = false;
+
+    if (jarPath && existsSync(jarPath)) {
+      const buf = readFileSync(jarPath);
+      size = buf.length;
+      if (!sha256) {
+        sha256 = createHash("sha256").update(buf).digest("hex");
+      }
+      hasLocalJar = true;
+    }
+
+    console.log(`[update] latest mod version=${version} (${hasLocalJar ? `${file}, ${size} bytes` : externalUrl || "no jar yet"})`);
+    return {
+      version,
+      file,
+      jarPath,
+      hasLocalJar,
+      size,
+      sha256,
+      downloadPath: externalUrl || "/api/update/download",
+    };
+  } catch (err) {
+    console.warn(`[update] failed to read ${manifestPath}:`, err.message);
+    return null;
+  }
+}
+
+let releaseInfo = loadReleaseInfo();
 
 const seedProvider = new SeedProvider(SEEDS_DIR);
 seedProvider.init();
 const profileStore = new ProfileStore(PROFILES_DB);
 profileStore.init();
 process.on("SIGHUP", () => {
-  console.log("[seeds] SIGHUP received — reloading SQLite seed packs...");
+  console.log("[seeds] SIGHUP received — reloading SQLite seed packs & release info...");
   seedProvider.reload();
+  releaseInfo = loadReleaseInfo();
 });
 const MAX_PAYLOAD_BYTES = 8 * 1024;
 const RATE_LIMIT_WINDOW_MS = 1000;
@@ -28,6 +115,7 @@ const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const sessionsByToken = new Map(); // resumeToken -> Session
 const roomsByCode = new Map();     // code -> Room
 const matchesById = new Map();     // matchId -> Match
+const recentMatchStats = new Map(); // matchId -> { uuids: Set, submitted: Set, expiresAt }
 const queuesByMode = new Map();    // mode -> Set<Session>
 
 let countsBroadcastTimer = null;
@@ -159,22 +247,35 @@ function leaveRoom(session) {
 function startMatch(mode, playerSessions, roomCode = null) {
   const matchId = randomUUID();
   const { overworldSeed, netherSeed, endSeed, types } = seedProvider.pickMatchSeeds(mode);
+  const modeFlags = MODE_FLAGS.get(mode) || { lastStanding: false, scoreMode: false };
+  const now = Date.now();
+  for (const [id, rec] of recentMatchStats) {
+    if (rec.expiresAt <= now) {
+      recentMatchStats.delete(id);
+    }
+  }
   const match = {
     id: matchId,
     roomCode,
     mode,
-    lastStanding: mode === "time_trial",
-    scoreMode: mode === "craft_random_item",
+    lastStanding: modeFlags.lastStanding,
+    scoreMode: modeFlags.scoreMode,
     overworldSeed,
     netherSeed,
     endSeed,
     players: playerSessions,
     loaded: new Set(),
     results: new Map(), // uuid -> { name, time, score, status, forfeited }
+    statsSubmitted: new Set(),
     startedAt: 0,
     finished: false,
   };
   matchesById.set(matchId, match);
+  recentMatchStats.set(matchId, {
+    uuids: new Set(playerSessions.map((p) => p.uuid)),
+    submitted: match.statsSubmitted,
+    expiresAt: Date.now() + 2 * 60 * 60 * 1000,
+  });
 
   for (const s of match.players) {
     s.matchId = matchId;
@@ -294,6 +395,41 @@ const httpServer = createServer((req, res) => {
     return;
   }
 
+  // Mod auto-update endpoints: GET /api/update/latest and GET /api/update/download
+  if (pathname === "/api/update/latest") {
+    if (!releaseInfo) {
+      res.writeHead(404, { "content-type": "application/json", "access-control-allow-origin": "*" });
+      res.end(JSON.stringify({ error: "no_release_configured" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*" });
+    res.end(JSON.stringify({
+      version: releaseInfo.version,
+      file: releaseInfo.file,
+      size: releaseInfo.size,
+      sha256: releaseInfo.sha256,
+      downloadUrl: releaseInfo.downloadPath,
+    }));
+    return;
+  }
+
+  if (pathname === "/api/update/download") {
+    if (!releaseInfo || !releaseInfo.hasLocalJar || !existsSync(releaseInfo.jarPath)) {
+      res.writeHead(404, { "content-type": "application/json", "access-control-allow-origin": "*" });
+      res.end(JSON.stringify({ error: "release_jar_not_found" }));
+      return;
+    }
+    const stat = statSync(releaseInfo.jarPath);
+    res.writeHead(200, {
+      "content-type": "application/java-archive",
+      "content-length": stat.size,
+      "content-disposition": `attachment; filename="${releaseInfo.file}"`,
+      "access-control-allow-origin": "*",
+    });
+    createReadStream(releaseInfo.jarPath).pipe(res);
+    return;
+  }
+
   // Public seed fetch for Singleplayer runs: GET /api/seeds/next?mode=time_trial
   if (req.method === "GET" && pathname === "/api/seeds/next") {
     const mode = parsedUrl.searchParams.get("mode") || "time_trial";
@@ -361,7 +497,13 @@ wss.on("connection", (ws) => {
   let rateWindowStart = Date.now();
   let rateCount = 0;
 
-  send(ws, { type: "hello", serverVersion: SERVER_VERSION });
+  send(ws, {
+    type: "hello",
+    serverVersion: SERVER_VERSION,
+    latestModVersion: releaseInfo ? releaseInfo.version : "",
+    updateDownloadPath: releaseInfo ? releaseInfo.downloadPath : "",
+    updateSha256: releaseInfo ? releaseInfo.sha256 : "",
+  });
 
   ws.on("message", async (raw) => {
     // Simple per-socket rate limiter
@@ -395,6 +537,11 @@ wss.on("connection", (ws) => {
 
     // --- Login (Mojang verified only, no offline accounts) ---
     if (type === "login") {
+      if (releaseInfo && releaseInfo.version && msg.modVersion !== releaseInfo.version) {
+        sendError(ws, "outdated_client", `Update required: v${releaseInfo.version}`);
+        ws.close(4001, "outdated_client");
+        return;
+      }
       const verified = await verifyMojangSession(msg.username, msg.serverId);
       if (!verified) {
         sendError(ws, "auth_failed", "Mojang authentication failed. Offline accounts are not allowed.");
@@ -407,6 +554,8 @@ wss.on("connection", (ws) => {
         name: verified.name,
         uuid: verified.uuid,
         cosmetics: profile.cosmetics,
+        stats: profile.stats,
+        unlocks: profile.unlocks,
         resumeToken,
         roomCode: null,
         queuedMode: null,
@@ -419,6 +568,8 @@ wss.on("connection", (ws) => {
         uuid: session.uuid,
         resumeToken,
         cosmetics: session.cosmetics,
+        stats: session.stats,
+        unlocks: session.unlocks,
       });
       sendModeCounts(ws);
       console.log(`[auth] ${session.name} logged in`);
@@ -427,6 +578,11 @@ wss.on("connection", (ws) => {
 
     // --- Resume ---
     if (type === "resume") {
+      if (releaseInfo && releaseInfo.version && msg.modVersion !== releaseInfo.version) {
+        sendError(ws, "outdated_client", `Update required: v${releaseInfo.version}`);
+        ws.close(4001, "outdated_client");
+        return;
+      }
       const existing = typeof msg.resumeToken === "string" ? sessionsByToken.get(msg.resumeToken) : null;
       if (!existing) {
         sendError(ws, "auth_failed", "Invalid or expired resume token.");
@@ -440,6 +596,8 @@ wss.on("connection", (ws) => {
         uuid: session.uuid,
         resumeToken: session.resumeToken,
         cosmetics: session.cosmetics || {},
+        stats: session.stats || {},
+        unlocks: session.unlocks || {},
       });
       sendModeCounts(ws);
       return;
@@ -459,6 +617,33 @@ wss.on("connection", (ws) => {
       if (session.roomCode) {
         const room = roomsByCode.get(session.roomCode);
         if (room) broadcastRoom(room);
+      }
+      return;
+    }
+
+    // --- End-of-match vanilla stats & achievement events ---
+    if (type === "match_stats") {
+      const record = recentMatchStats.get(msg.matchId);
+      if (!record || !record.uuids.has(session.uuid) || record.submitted.has(session.uuid)) {
+        return;
+      }
+      record.submitted.add(session.uuid);
+      const { profile, newlyUnlocked } = profileStore.applyMatchStats(
+        session.uuid,
+        session.name,
+        msg.stats,
+        msg.events
+      );
+      session.stats = profile.stats;
+      session.unlocks = profile.unlocks;
+      send(ws, {
+        type: "profile_sync",
+        stats: profile.stats,
+        unlocks: profile.unlocks,
+        newlyUnlocked,
+      });
+      if (newlyUnlocked.length > 0) {
+        console.log(`[unlocks] ${session.name} unlocked: ${newlyUnlocked.map((u) => `${u.category}:${u.id}`).join(", ")}`);
       }
       return;
     }
