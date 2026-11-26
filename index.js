@@ -57,7 +57,7 @@ function loadReleaseInfo() {
     return null;
   }
   try {
-    const raw = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const raw = JSON.parse(readFileSync(manifestPath, "utf8").replace(/^\uFEFF/, ""));
     const version = typeof raw.version === "string" ? raw.version.trim() : "";
     if (!version) return null;
 
