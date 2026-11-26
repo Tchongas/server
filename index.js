@@ -11,8 +11,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function loadModeFlags() {
   const flags = new Map([
-    ["time_trial", { lastStanding: true, scoreMode: false }],
-    ["craft_random_item", { lastStanding: false, scoreMode: true }],
+    ["time_trial", { lastStanding: true, scoreMode: false, minXpSeconds: 60 }],
+    ["craft_random_item", { lastStanding: false, scoreMode: true, minXpSeconds: 60 }],
   ]);
   const candidates = [
     process.env.MODES_CONFIG,
@@ -30,7 +30,10 @@ function loadModeFlags() {
           const scoreMode = String(m.resultType || "").toUpperCase() === "SCORE"
             || String(m.tabListType || "").toUpperCase() === "SCORE";
           const lastStanding = !scoreMode && String(m.tabListType || "").toUpperCase() === "REMAINING_TIME";
-          flags.set(id, { lastStanding, scoreMode });
+          const minXpSeconds = Number.isFinite(Number(m.minXpSeconds)) && Number(m.minXpSeconds) >= 0
+            ? Math.floor(Number(m.minXpSeconds))
+            : 60;
+          flags.set(id, { lastStanding, scoreMode, minXpSeconds });
         }
         console.log(`[modes] loaded ${flags.size} mode definitions from ${filePath}`);
       }
@@ -351,6 +354,9 @@ function finishMatch(match, winnerName, standings, winnerTime = 0) {
   matchesById.delete(match.id);
 
   const finishTime = winnerTime || (match.startedAt > 0 ? Math.max(0, Date.now() - match.startedAt) : 0);
+  const modeCfg = MODE_FLAGS.get(match.mode) || { minXpSeconds: 60 };
+  const minXpMs = (modeCfg.minXpSeconds ?? 60) * 1000;
+
   for (const s of match.players) {
     s.matchId = null;
     send(s.ws, {
@@ -361,6 +367,25 @@ function finishMatch(match, winnerName, standings, winnerTime = 0) {
       eloDelta: 0,
       standings,
     });
+
+    // Award multiplayer XP only if the player finished (not forfeited) and played >= minXpSeconds
+    const res = match.results.get(s.uuid);
+    if (res && !res.forfeited && res.time >= minXpMs) {
+      const isWinner = winnerName && s.name.toLowerCase() === winnerName.toLowerCase();
+      const xpGain = isWinner ? 125 : 100;
+      const { profile, newlyUnlocked } = profileStore.addXp(s.uuid, s.name, xpGain);
+      s.xp = profile.xp;
+      s.level = profile.level;
+      s.unlocks = profile.unlocks;
+      send(s.ws, {
+        type: "profile_sync",
+        stats: profile.stats,
+        unlocks: profile.unlocks,
+        xp: profile.xp,
+        level: profile.level,
+        newlyUnlocked,
+      });
+    }
   }
 
   // Keep the room alive for the next round with ready flags reset
@@ -556,6 +581,9 @@ wss.on("connection", (ws) => {
         cosmetics: profile.cosmetics,
         stats: profile.stats,
         unlocks: profile.unlocks,
+        xp: profile.xp,
+        level: profile.level,
+        lastSpXpAt: 0,
         resumeToken,
         roomCode: null,
         queuedMode: null,
@@ -570,6 +598,8 @@ wss.on("connection", (ws) => {
         cosmetics: session.cosmetics,
         stats: session.stats,
         unlocks: session.unlocks,
+        xp: session.xp,
+        level: session.level,
       });
       sendModeCounts(ws);
       console.log(`[auth] ${session.name} logged in`);
@@ -598,6 +628,8 @@ wss.on("connection", (ws) => {
         cosmetics: session.cosmetics || {},
         stats: session.stats || {},
         unlocks: session.unlocks || {},
+        xp: session.xp || 0,
+        level: session.level || 0,
       });
       sendModeCounts(ws);
       return;
@@ -640,10 +672,37 @@ wss.on("connection", (ws) => {
         type: "profile_sync",
         stats: profile.stats,
         unlocks: profile.unlocks,
+        xp: profile.xp,
+        level: profile.level,
         newlyUnlocked,
       });
       if (newlyUnlocked.length > 0) {
         console.log(`[unlocks] ${session.name} unlocked: ${newlyUnlocked.map((u) => `${u.category}:${u.id}`).join(", ")}`);
+      }
+      return;
+    }
+
+    // --- Singleplayer finished run XP ---
+    if (type === "singleplayer_finish") {
+      const modeId = typeof msg.mode === "string" ? msg.mode.trim() : "time_trial";
+      const elapsedSeconds = Math.floor(Number(msg.elapsedSeconds) || 0);
+      const modeCfg = MODE_FLAGS.get(modeId) || { minXpSeconds: 60 };
+      const minSecs = modeCfg.minXpSeconds ?? 60;
+      const nowMs = Date.now();
+      if (elapsedSeconds >= minSecs && nowMs - (session.lastSpXpAt || 0) >= Math.max(15000, minSecs * 1000)) {
+        session.lastSpXpAt = nowMs;
+        const { profile, newlyUnlocked } = profileStore.addXp(session.uuid, session.name, 50);
+        session.xp = profile.xp;
+        session.level = profile.level;
+        session.unlocks = profile.unlocks;
+        send(ws, {
+          type: "profile_sync",
+          stats: profile.stats,
+          unlocks: profile.unlocks,
+          xp: profile.xp,
+          level: profile.level,
+          newlyUnlocked,
+        });
       }
       return;
     }
