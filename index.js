@@ -796,6 +796,26 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (type === "match_chat") {
+      const match = matchesById.get(msg.matchId);
+      if (!match || !match.players.includes(session) || match.finished) return;
+      const text = typeof msg.message === "string"
+        ? msg.message.replace(/[\r\n\u0000-\u001F\u007F]/g, " ").trim().slice(0, 256)
+        : "";
+      if (!text) return;
+      for (const s of match.players) {
+        if (s !== session) {
+          send(s.ws, {
+            type: "match_chat",
+            matchId: match.id,
+            playerName: session.name,
+            message: text,
+          });
+        }
+      }
+      return;
+    }
+
     if (type === "split") {
       const match = matchesById.get(msg.matchId);
       if (!match || !match.players.includes(session) || match.finished) return;
