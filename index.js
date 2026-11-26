@@ -9,10 +9,67 @@ import { ProfileStore } from "./profiles/profileStore.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+const DEFAULT_XP_CFG = {
+  scaling: "TIME",
+  minSeconds: 60,
+  base: 40,
+  perUnit: 10,
+  unitStep: 30,
+  max: 250,
+  multiplayerMultiplier: 1.5,
+  winBonus: 35,
+};
+
+function parseXpConfig(raw, fallbackMinSeconds = 60) {
+  if (!raw || typeof raw !== "object") {
+    return { ...DEFAULT_XP_CFG, minSeconds: fallbackMinSeconds };
+  }
+  const scaling = String(raw.scaling || DEFAULT_XP_CFG.scaling).toUpperCase();
+  const minSeconds = Number.isFinite(Number(raw.minSeconds)) && Number(raw.minSeconds) >= 0
+    ? Math.floor(Number(raw.minSeconds)) : fallbackMinSeconds;
+  const base = Number.isFinite(Number(raw.base)) ? Math.max(0, Math.floor(Number(raw.base))) : DEFAULT_XP_CFG.base;
+  const perUnit = Number.isFinite(Number(raw.perUnit)) ? Math.max(0, Number(raw.perUnit)) : DEFAULT_XP_CFG.perUnit;
+  const unitStep = Number.isFinite(Number(raw.unitStep)) && Number(raw.unitStep) > 0
+    ? Number(raw.unitStep) : DEFAULT_XP_CFG.unitStep;
+  const max = Number.isFinite(Number(raw.max)) && Number(raw.max) >= base
+    ? Math.floor(Number(raw.max)) : Math.max(base, DEFAULT_XP_CFG.max);
+  const multiplayerMultiplier = Number.isFinite(Number(raw.multiplayerMultiplier)) && Number(raw.multiplayerMultiplier) >= 1
+    ? Number(raw.multiplayerMultiplier) : DEFAULT_XP_CFG.multiplayerMultiplier;
+  const winBonus = Number.isFinite(Number(raw.winBonus)) ? Math.max(0, Math.floor(Number(raw.winBonus))) : DEFAULT_XP_CFG.winBonus;
+  return { scaling, minSeconds, base, perUnit, unitStep, max, multiplayerMultiplier, winBonus };
+}
+
+function computeRunXp(xpCfg, { elapsedSeconds = 0, score = 0, multiplayer = false, winner = false }) {
+  const cfg = xpCfg || DEFAULT_XP_CFG;
+  if (elapsedSeconds < cfg.minSeconds) return 0;
+
+  let units = 0;
+  if (cfg.scaling === "SCORE") {
+    units = Math.max(0, Number(score) || 0) / cfg.unitStep;
+  } else if (cfg.scaling === "TIME") {
+    units = Math.max(0, Number(elapsedSeconds) || 0) / cfg.unitStep;
+  }
+
+  let rawXp = Math.round(cfg.base + units * cfg.perUnit);
+  rawXp = Math.min(cfg.max, Math.max(cfg.base, rawXp));
+
+  if (multiplayer) {
+    rawXp = Math.round(rawXp * cfg.multiplayerMultiplier);
+    if (winner) {
+      rawXp += cfg.winBonus;
+    }
+  }
+  return Math.max(0, rawXp);
+}
+
 function loadModeFlags() {
   const flags = new Map([
-    ["time_trial", { lastStanding: true, scoreMode: false, minXpSeconds: 60 }],
-    ["craft_random_item", { lastStanding: false, scoreMode: true, minXpSeconds: 60 }],
+    ["time_trial", { lastStanding: true, scoreMode: false, xp: { ...DEFAULT_XP_CFG } }],
+    ["craft_random_item", {
+      lastStanding: false,
+      scoreMode: true,
+      xp: { ...DEFAULT_XP_CFG, scaling: "SCORE", base: 30, perUnit: 15, unitStep: 1 },
+    }],
   ]);
   const candidates = [
     process.env.MODES_CONFIG,
@@ -30,10 +87,10 @@ function loadModeFlags() {
           const scoreMode = String(m.resultType || "").toUpperCase() === "SCORE"
             || String(m.tabListType || "").toUpperCase() === "SCORE";
           const lastStanding = !scoreMode && String(m.tabListType || "").toUpperCase() === "REMAINING_TIME";
-          const minXpSeconds = Number.isFinite(Number(m.minXpSeconds)) && Number(m.minXpSeconds) >= 0
-            ? Math.floor(Number(m.minXpSeconds))
-            : 60;
-          flags.set(id, { lastStanding, scoreMode, minXpSeconds });
+          const fallbackMin = Number.isFinite(Number(m.minXpSeconds)) && Number(m.minXpSeconds) >= 0
+            ? Math.floor(Number(m.minXpSeconds)) : 60;
+          const xp = parseXpConfig(m.xp, fallbackMin);
+          flags.set(id, { lastStanding, scoreMode, xp });
         }
         console.log(`[modes] loaded ${flags.size} mode definitions from ${filePath}`);
       }
@@ -354,8 +411,7 @@ function finishMatch(match, winnerName, standings, winnerTime = 0) {
   matchesById.delete(match.id);
 
   const finishTime = winnerTime || (match.startedAt > 0 ? Math.max(0, Date.now() - match.startedAt) : 0);
-  const modeCfg = MODE_FLAGS.get(match.mode) || { minXpSeconds: 60 };
-  const minXpMs = (modeCfg.minXpSeconds ?? 60) * 1000;
+  const modeCfg = MODE_FLAGS.get(match.mode) || { xp: DEFAULT_XP_CFG };
 
   for (const s of match.players) {
     s.matchId = null;
@@ -368,23 +424,30 @@ function finishMatch(match, winnerName, standings, winnerTime = 0) {
       standings,
     });
 
-    // Award multiplayer XP only if the player finished (not forfeited) and played >= minXpSeconds
+    // Award performance-scaled multiplayer XP if the player finished (not forfeited)
     const res = match.results.get(s.uuid);
-    if (res && !res.forfeited && res.time >= minXpMs) {
-      const isWinner = winnerName && s.name.toLowerCase() === winnerName.toLowerCase();
-      const xpGain = isWinner ? 125 : 100;
-      const { profile, newlyUnlocked } = profileStore.addXp(s.uuid, s.name, xpGain);
-      s.xp = profile.xp;
-      s.level = profile.level;
-      s.unlocks = profile.unlocks;
-      send(s.ws, {
-        type: "profile_sync",
-        stats: profile.stats,
-        unlocks: profile.unlocks,
-        xp: profile.xp,
-        level: profile.level,
-        newlyUnlocked,
+    if (res && !res.forfeited) {
+      const isWinner = Boolean(winnerName && s.name.toLowerCase() === winnerName.toLowerCase());
+      const xpGain = computeRunXp(modeCfg.xp, {
+        elapsedSeconds: Math.floor((res.time || 0) / 1000),
+        score: res.score >= 0 ? res.score : 0,
+        multiplayer: true,
+        winner: isWinner,
       });
+      if (xpGain > 0) {
+        const { profile, newlyUnlocked } = profileStore.addXp(s.uuid, s.name, xpGain);
+        s.xp = profile.xp;
+        s.level = profile.level;
+        s.unlocks = profile.unlocks;
+        send(s.ws, {
+          type: "profile_sync",
+          stats: profile.stats,
+          unlocks: profile.unlocks,
+          xp: profile.xp,
+          level: profile.level,
+          newlyUnlocked,
+        });
+      }
     }
   }
 
@@ -686,23 +749,32 @@ wss.on("connection", (ws) => {
     if (type === "singleplayer_finish") {
       const modeId = typeof msg.mode === "string" ? msg.mode.trim() : "time_trial";
       const elapsedSeconds = Math.floor(Number(msg.elapsedSeconds) || 0);
-      const modeCfg = MODE_FLAGS.get(modeId) || { minXpSeconds: 60 };
-      const minSecs = modeCfg.minXpSeconds ?? 60;
+      const score = Math.max(0, Math.floor(Number(msg.score) || 0));
+      const modeCfg = MODE_FLAGS.get(modeId) || { xp: DEFAULT_XP_CFG };
+      const minSecs = modeCfg.xp?.minSeconds ?? 60;
       const nowMs = Date.now();
       if (elapsedSeconds >= minSecs && nowMs - (session.lastSpXpAt || 0) >= Math.max(15000, minSecs * 1000)) {
-        session.lastSpXpAt = nowMs;
-        const { profile, newlyUnlocked } = profileStore.addXp(session.uuid, session.name, 50);
-        session.xp = profile.xp;
-        session.level = profile.level;
-        session.unlocks = profile.unlocks;
-        send(ws, {
-          type: "profile_sync",
-          stats: profile.stats,
-          unlocks: profile.unlocks,
-          xp: profile.xp,
-          level: profile.level,
-          newlyUnlocked,
+        const xpGain = computeRunXp(modeCfg.xp, {
+          elapsedSeconds,
+          score,
+          multiplayer: false,
+          winner: false,
         });
+        if (xpGain > 0) {
+          session.lastSpXpAt = nowMs;
+          const { profile, newlyUnlocked } = profileStore.addXp(session.uuid, session.name, xpGain);
+          session.xp = profile.xp;
+          session.level = profile.level;
+          session.unlocks = profile.unlocks;
+          send(ws, {
+            type: "profile_sync",
+            stats: profile.stats,
+            unlocks: profile.unlocks,
+            xp: profile.xp,
+            level: profile.level,
+            newlyUnlocked,
+          });
+        }
       }
       return;
     }
