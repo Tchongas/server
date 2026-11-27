@@ -325,6 +325,7 @@ function startMatch(mode, playerSessions, roomCode = null) {
     endSeed,
     players: playerSessions,
     loaded: new Set(),
+    seedVotes: new Set(),
     results: new Map(), // uuid -> { name, time, score, status, forfeited }
     statsSubmitted: new Set(),
     startedAt: 0,
@@ -1003,6 +1004,41 @@ wss.on("connection", (ws) => {
       });
       broadcastMatchNotice(match, `${session.name} forfeited the match.`);
       maybeCompleteMatch(match);
+    }
+
+    if (type === "vote") {
+      const match = matchesById.get(msg.matchId);
+      if (!match || !match.players.includes(session) || match.finished) return;
+      if (msg.voteType !== "seed_change") return;
+      if (match.startedAt <= 0) return;
+
+      // Only allow seed-change votes within the first 40 seconds
+      const elapsedMs = Date.now() - match.startedAt;
+      if (elapsedMs > 40000) return;
+
+      match.seedVotes.add(session.uuid);
+      const votes = match.seedVotes.size;
+      const needed = Math.max(1, Math.ceil((match.players.length * 2) / 3));
+      const passed = votes >= needed;
+
+      for (const s of match.players) {
+        send(s.ws, {
+          type: "vote_state",
+          matchId: match.id,
+          voteType: "seed_change",
+          votes,
+          needed,
+          passed,
+        });
+      }
+
+      if (passed) {
+        match.finished = true;
+        matchesById.delete(match.id);
+        broadcastMatchNotice(match, "Seed change vote passed! Generating a new seed...");
+        console.log(`[match] ${match.id} seed_change passed (${votes}/${needed}); restarting with new seed`);
+        startMatch(match.mode, match.players, match.roomCode);
+      }
     }
   });
 
