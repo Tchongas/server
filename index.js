@@ -1059,6 +1059,24 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
+    if (type === "room_chat") {
+      if (!session.roomCode) return;
+      const room = roomsByCode.get(session.roomCode);
+      if (!room) return;
+      const text = typeof msg.message === "string"
+        ? msg.message.replace(/[\r\n\u0000-\u001F\u007F]/g, " ").trim().slice(0, 200)
+        : "";
+      if (!text) return;
+      for (const p of room.players) {
+        send(p.session.ws, {
+          type: "room_chat",
+          playerName: session.name,
+          message: text,
+        });
+      }
+      return;
+    }
+
     if (type === "room_set_mode") {
       if (!session.roomCode) return;
       const room = roomsByCode.get(session.roomCode);
