@@ -1,7 +1,7 @@
 import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 import { SeedProvider } from "./seeds/seedProvider.js";
@@ -62,12 +62,33 @@ function computeRunXp(xpCfg, { elapsedSeconds = 0, score = 0, multiplayer = fals
   return Math.max(0, rawXp);
 }
 
+function parseSeedTypes(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out = {};
+  for (const dim of ["overworld", "nether", "end"]) {
+    const val = raw[dim];
+    if (typeof val === "string" && val.trim()) {
+      out[dim] = [val.trim().toLowerCase()];
+    } else if (Array.isArray(val)) {
+      const list = val.map((v) => String(v || "").trim().toLowerCase()).filter(Boolean);
+      if (list.length > 0) out[dim] = list;
+    }
+  }
+  return out;
+}
+
 function loadModeFlags() {
   const flags = new Map([
-    ["time_trial", { lastStanding: true, scoreMode: false, xp: { ...DEFAULT_XP_CFG } }],
+    ["time_trial", {
+      lastStanding: true,
+      scoreMode: false,
+      seedTypes: { overworld: ["village"] },
+      xp: { ...DEFAULT_XP_CFG },
+    }],
     ["craft_random_item", {
       lastStanding: false,
       scoreMode: true,
+      seedTypes: {},
       xp: { ...DEFAULT_XP_CFG, scaling: "SCORE", base: 30, perUnit: 15, unitStep: 1 },
     }],
   ]);
@@ -90,7 +111,8 @@ function loadModeFlags() {
           const fallbackMin = Number.isFinite(Number(m.minXpSeconds)) && Number(m.minXpSeconds) >= 0
             ? Math.floor(Number(m.minXpSeconds)) : 60;
           const xp = parseXpConfig(m.xp, fallbackMin);
-          flags.set(id, { lastStanding, scoreMode, xp });
+          const seedTypes = parseSeedTypes(m.seedTypes);
+          flags.set(id, { lastStanding, scoreMode, seedTypes, xp });
         }
         console.log(`[modes] loaded ${flags.size} mode definitions from ${filePath}`);
       }
@@ -123,7 +145,11 @@ function loadReleaseInfo() {
 
     const externalUrl = typeof raw.downloadUrl === "string" && raw.downloadUrl.trim() ? raw.downloadUrl.trim() : "";
     const file = typeof raw.file === "string" ? raw.file.trim() : "";
-    const jarPath = file ? resolve(RELEASES_DIR, file) : "";
+    let jarPath = file ? resolve(RELEASES_DIR, file) : "";
+    if (jarPath && !jarPath.startsWith(RELEASES_DIR + sep)) {
+      console.warn(`[update] ignoring unsafe release file path: ${file}`);
+      jarPath = "";
+    }
 
     let sha256 = typeof raw.sha256 === "string" ? raw.sha256.trim() : "";
     let size = 0;
@@ -168,15 +194,59 @@ process.on("SIGHUP", () => {
 const MAX_PAYLOAD_BYTES = 8 * 1024;
 const RATE_LIMIT_WINDOW_MS = 1000;
 const RATE_LIMIT_MAX_MSGS = 30;
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_WS_PER_IP = 5;
+const HTTP_RATE_WINDOW_MS = 60 * 1000;
 const COUNTDOWN_SECONDS = 5;
 const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 // In-memory state (no DB, no ELO, no match history)
 const sessionsByToken = new Map(); // resumeToken -> Session
+const sessionsByUuid = new Map();  // uuid -> Session (prevents duplicate logins / self-matchmaking)
+const wsCountByIp = new Map();     // ip -> active WS count
+const httpRateByIp = new Map();    // ip:bucket -> { start, count }
 const roomsByCode = new Map();     // code -> Room
 const matchesById = new Map();     // matchId -> Match
 const recentMatchStats = new Map(); // matchId -> { uuids: Set, submitted: Set, expiresAt }
 const queuesByMode = new Map();    // mode -> Set<Session>
+
+function getClientIp(req) {
+  const fwd = req?.headers?.["x-forwarded-for"];
+  if (typeof fwd === "string" && fwd.trim()) {
+    return fwd.split(",")[0].trim();
+  }
+  return req?.socket?.remoteAddress || "unknown";
+}
+
+function allowHttpRequest(ip, bucket, maxPerWindow) {
+  const key = `${ip}:${bucket}`;
+  const now = Date.now();
+  let rec = httpRateByIp.get(key);
+  if (!rec || now - rec.start >= HTTP_RATE_WINDOW_MS) {
+    rec = { start: now, count: 0 };
+    httpRateByIp.set(key, rec);
+  }
+  rec.count++;
+  return rec.count <= maxPerWindow;
+}
+
+// Periodic cleanup of expired resume tokens and stale HTTP rate buckets
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, s] of sessionsByToken) {
+    if (now - (s.lastSeenAt || 0) > SESSION_TTL_MS && (!s.ws || s.ws.readyState !== s.ws.OPEN)) {
+      sessionsByToken.delete(token);
+      if (sessionsByUuid.get(s.uuid) === s) {
+        sessionsByUuid.delete(s.uuid);
+      }
+    }
+  }
+  for (const [key, rec] of httpRateByIp) {
+    if (now - rec.start >= HTTP_RATE_WINDOW_MS) {
+      httpRateByIp.delete(key);
+    }
+  }
+}, 5 * 60 * 1000).unref();
 
 let countsBroadcastTimer = null;
 let lastCountsJson = "";
@@ -279,7 +349,7 @@ function broadcastRoom(room) {
     players: room.players.map((p) => ({
       name: p.name,
       ready: p.ready,
-      cosmetics: p.session.cosmetics || {},
+      cosmetics: { ...(p.session.cosmetics || {}), level: p.session.level || 0 },
     })),
   };
   for (const p of room.players) {
@@ -304,10 +374,10 @@ function leaveRoom(session) {
   }
 }
 
-function startMatch(mode, playerSessions, roomCode = null) {
+function startMatch(mode, playerSessions, roomCode = null, seedChanged = false) {
   const matchId = randomUUID();
-  const { overworldSeed, netherSeed, endSeed, types } = seedProvider.pickMatchSeeds(mode);
-  const modeFlags = MODE_FLAGS.get(mode) || { lastStanding: false, scoreMode: false };
+  const modeFlags = MODE_FLAGS.get(mode) || { lastStanding: false, scoreMode: false, seedTypes: {} };
+  const { overworldSeed, netherSeed, endSeed, types } = seedProvider.pickMatchSeeds(mode, modeFlags.seedTypes || {});
   const now = Date.now();
   for (const [id, rec] of recentMatchStats) {
     if (rec.expiresAt <= now) {
@@ -318,6 +388,7 @@ function startMatch(mode, playerSessions, roomCode = null) {
     id: matchId,
     roomCode,
     mode,
+    seedChanged: Boolean(seedChanged),
     lastStanding: modeFlags.lastStanding,
     scoreMode: modeFlags.scoreMode,
     overworldSeed,
@@ -344,7 +415,7 @@ function startMatch(mode, playerSessions, roomCode = null) {
     const opponents = opponentSessions.map((o) => o.name);
     const opponentProfiles = {};
     for (const o of opponentSessions) {
-      opponentProfiles[o.name] = o.cosmetics || {};
+      opponentProfiles[o.name] = { ...(o.cosmetics || {}), level: o.level || 0 };
     }
     send(s.ws, {
       type: "match_assigned",
@@ -354,6 +425,7 @@ function startMatch(mode, playerSessions, roomCode = null) {
       endSeed,
       startsAt: 0,
       mode: match.mode,
+      seedChanged: match.seedChanged,
       opponents,
       opponentProfiles,
     });
@@ -521,8 +593,14 @@ const httpServer = createServer((req, res) => {
 
   // Public seed fetch for Singleplayer runs: GET /api/seeds/next?mode=time_trial
   if (req.method === "GET" && pathname === "/api/seeds/next") {
+    if (!allowHttpRequest(getClientIp(req), "seeds", 30)) {
+      res.writeHead(429, { "content-type": "application/json", "access-control-allow-origin": "*" });
+      res.end(JSON.stringify({ error: "rate_limited" }));
+      return;
+    }
     const mode = parsedUrl.searchParams.get("mode") || "time_trial";
-    const picked = seedProvider.pickMatchSeeds(mode);
+    const modeFlags = MODE_FLAGS.get(mode) || { seedTypes: {} };
+    const picked = seedProvider.pickMatchSeeds(mode, modeFlags.seedTypes || {});
     res.writeHead(200, {
       "content-type": "application/json",
       "cache-control": "no-store",
@@ -534,6 +612,11 @@ const httpServer = createServer((req, res) => {
 
   // Batch lookup: GET /api/profiles?names=Alice,Bob or ?uuids=...
   if (req.method === "GET" && pathname === "/api/profiles") {
+    if (!allowHttpRequest(getClientIp(req), "profiles", 60)) {
+      res.writeHead(429, { "content-type": "application/json", "access-control-allow-origin": "*" });
+      res.end(JSON.stringify({ error: "rate_limited" }));
+      return;
+    }
     const namesParam = parsedUrl.searchParams.get("names");
     const uuidsParam = parsedUrl.searchParams.get("uuids");
     const profiles = namesParam
@@ -581,7 +664,22 @@ const wss = new WebSocketServer({
   maxPayload: MAX_PAYLOAD_BYTES,
 });
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+  const clientIp = getClientIp(req);
+  const ipCount = (wsCountByIp.get(clientIp) || 0) + 1;
+  if (ipCount > MAX_WS_PER_IP) {
+    ws.close(4008, "too_many_connections");
+    return;
+  }
+  wsCountByIp.set(clientIp, ipCount);
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+  ws.on("close", () => {
+    const cur = (wsCountByIp.get(clientIp) || 1) - 1;
+    if (cur <= 0) wsCountByIp.delete(clientIp);
+    else wsCountByIp.set(clientIp, cur);
+  });
+
   let session = null;
   let rateWindowStart = Date.now();
   let rateCount = 0;
@@ -637,6 +735,16 @@ wss.on("connection", (ws) => {
         return;
       }
       const profile = profileStore.ensureProfile(verified.uuid, verified.name);
+      // Invalidate any previous session for this UUID to prevent duplicate logins / self-matchmaking
+      const prevSession = sessionsByUuid.get(verified.uuid);
+      if (prevSession) {
+        leaveQueue(prevSession, false);
+        leaveRoom(prevSession);
+        sessionsByToken.delete(prevSession.resumeToken);
+        if (prevSession.ws && prevSession.ws !== ws && prevSession.ws.readyState === prevSession.ws.OPEN) {
+          prevSession.ws.close(4002, "session_replaced");
+        }
+      }
       const resumeToken = randomBytes(24).toString("hex");
       session = {
         ws,
@@ -648,12 +756,14 @@ wss.on("connection", (ws) => {
         xp: profile.xp,
         level: profile.level,
         lastSpXpAt: 0,
+        lastSeenAt: Date.now(),
         resumeToken,
         roomCode: null,
         queuedMode: null,
         matchId: null,
       };
       sessionsByToken.set(resumeToken, session);
+      sessionsByUuid.set(verified.uuid, session);
       send(ws, {
         type: "login_ok",
         name: session.name,
@@ -683,6 +793,7 @@ wss.on("connection", (ws) => {
         return;
       }
       existing.ws = ws;
+      existing.lastSeenAt = Date.now();
       session = existing;
       send(ws, {
         type: "login_ok",
@@ -788,6 +899,10 @@ wss.on("connection", (ws) => {
     // --- Matchmaking Queue ---
     if (type === "queue_join") {
       const mode = typeof msg.mode === "string" && msg.mode.trim() ? msg.mode.trim() : "time_trial";
+      if (!MODE_FLAGS.has(mode)) {
+        sendError(ws, "invalid_mode", "Unknown gamemode.");
+        return;
+      }
       leaveRoom(session);
       leaveQueue(session, false);
       let set = queuesByMode.get(mode);
@@ -802,17 +917,22 @@ wss.on("connection", (ws) => {
 
       if (set.size >= 2) {
         const pair = [];
+        const seenUuids = new Set();
         for (const s of set) {
+          if (seenUuids.has(s.uuid)) continue;
+          seenUuids.add(s.uuid);
           pair.push(s);
           if (pair.length === 2) break;
         }
-        for (const s of pair) {
-          set.delete(s);
-          s.queuedMode = null;
-          send(s.ws, { type: "queue_state", inQueue: false, queueSize: 0, mode: "" });
+        if (pair.length === 2) {
+          for (const s of pair) {
+            set.delete(s);
+            s.queuedMode = null;
+            send(s.ws, { type: "queue_state", inQueue: false, queueSize: 0, mode: "" });
+          }
+          if (set.size === 0) queuesByMode.delete(mode);
+          startMatch(mode, pair, null);
         }
-        if (set.size === 0) queuesByMode.delete(mode);
-        startMatch(mode, pair, null);
       }
       return;
     }
@@ -826,6 +946,10 @@ wss.on("connection", (ws) => {
     if (type === "room_create") {
       leaveRoom(session);
       const mode = typeof msg.mode === "string" && msg.mode.trim() ? msg.mode.trim() : "time_trial";
+      if (!MODE_FLAGS.has(mode)) {
+        sendError(ws, "invalid_mode", "Unknown gamemode.");
+        return;
+      }
       const code = generateRoomCode();
       const room = {
         code,
@@ -873,7 +997,7 @@ wss.on("connection", (ws) => {
       const room = roomsByCode.get(session.roomCode);
       if (!room || room.owner !== session.name) return;
       const mode = typeof msg.mode === "string" && msg.mode.trim() ? msg.mode.trim() : null;
-      if (!mode) return;
+      if (!mode || !MODE_FLAGS.has(mode)) return;
       room.mode = mode;
       for (const p of room.players) {
         p.ready = false;
@@ -951,13 +1075,15 @@ wss.on("connection", (ws) => {
     if (type === "split") {
       const match = matchesById.get(msg.matchId);
       if (!match || !match.players.includes(session) || match.finished) return;
+      const splitType = String(msg.splitType || "").replace(/[\r\n\u0000-\u001F\u007F]/g, "").slice(0, 64);
+      if (!splitType) return;
       for (const s of match.players) {
         if (s !== session) {
           send(s.ws, {
             type: "split_relay",
             matchId: match.id,
             playerName: session.name,
-            splitType: String(msg.splitType || ""),
+            splitType,
             at: Date.now(),
           });
         }
@@ -969,9 +1095,12 @@ wss.on("connection", (ws) => {
       const match = matchesById.get(msg.matchId);
       if (!match || !match.players.includes(session) || match.finished) return;
       if (match.results.has(session.uuid)) return;
-      const elapsed = match.startedAt > 0 ? Math.max(0, Date.now() - match.startedAt) : 0;
+      // Reject finishes before the synchronized countdown has actually started the match
+      if (match.startedAt <= 0 || Date.now() < match.startedAt) return;
+      const elapsed = Math.max(0, Date.now() - match.startedAt);
 
-      const score = match.scoreMode ? (Number.isFinite(Number(msg.score)) ? Number(msg.score) : 0) : -1;
+      const rawScore = Number.isFinite(Number(msg.score)) ? Math.floor(Number(msg.score)) : 0;
+      const score = match.scoreMode ? Math.max(0, Math.min(500, rawScore)) : -1;
       match.results.set(session.uuid, {
         name: session.name,
         time: elapsed,
@@ -1010,13 +1139,19 @@ wss.on("connection", (ws) => {
       const match = matchesById.get(msg.matchId);
       if (!match || !match.players.includes(session) || match.finished) return;
       if (msg.voteType !== "seed_change") return;
+      if (match.seedChanged) return;
       if (match.startedAt <= 0) return;
 
       // Only allow seed-change votes within the first 40 seconds
       const elapsedMs = Date.now() - match.startedAt;
       if (elapsedMs > 40000) return;
 
-      match.seedVotes.add(session.uuid);
+      const accept = msg.accept !== false;
+      if (accept) {
+        match.seedVotes.add(session.uuid);
+      } else {
+        match.seedVotes.delete(session.uuid);
+      }
       const votes = match.seedVotes.size;
       const needed = Math.max(1, Math.ceil((match.players.length * 2) / 3));
       const passed = votes >= needed;
@@ -1037,7 +1172,7 @@ wss.on("connection", (ws) => {
         matchesById.delete(match.id);
         broadcastMatchNotice(match, "Seed change vote passed! Generating a new seed...");
         console.log(`[match] ${match.id} seed_change passed (${votes}/${needed}); restarting with new seed`);
-        startMatch(match.mode, match.players, match.roomCode);
+        startMatch(match.mode, match.players, match.roomCode, true);
       }
     }
   });
@@ -1062,6 +1197,18 @@ wss.on("connection", (ws) => {
     }
   });
 });
+
+// 30s WebSocket heartbeat to terminate dead/half-open sockets
+setInterval(() => {
+  for (const client of wss.clients) {
+    if (client.isAlive === false) {
+      client.terminate();
+      continue;
+    }
+    client.isAlive = false;
+    client.ping();
+  }
+}, 30000).unref();
 
 httpServer.listen(PORT, HOST, () => {
   console.log(`[timetrials-server] listening on ws://${HOST}:${PORT}/ws`);

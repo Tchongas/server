@@ -36,12 +36,17 @@ function loadCosmeticsRules() {
     try {
       const cfg = JSON.parse(readFileSync(filePath, "utf8"));
       const rules = {};
+      const validIds = { title: new Set(), cardBg: new Set(["default"]) };
       const statKeys = new Set(["fish_caught", "kill_villager", "kill_endermite", "kill_silverfish"]);
 
       const addEntries = (category, list) => {
         if (!Array.isArray(list)) return;
         for (const item of list) {
-          if (!item || typeof item.id !== "string" || !item.unlock) continue;
+          if (!item || typeof item.id !== "string") continue;
+          const id = item.id.trim();
+          if (!id) continue;
+          if (validIds[category]) validIds[category].add(id);
+          if (!item.unlock) continue;
           const u = item.unlock;
           const rule = {};
           if (typeof u.stat === "string" && u.stat.trim() && Number(u.target) > 0) {
@@ -56,14 +61,14 @@ function loadCosmeticsRules() {
             continue;
           }
           if (!rules[category]) rules[category] = {};
-          rules[category][item.id.trim()] = rule;
+          rules[category][id] = rule;
         }
       };
 
       addEntries("title", cfg.titles);
       addEntries("cardBg", cfg.cardBackgrounds);
       console.log(`[profiles] loaded cosmetics config from ${filePath}`);
-      return { rules, statKeys };
+      return { rules, validIds, statKeys };
     } catch (err) {
       console.warn(`[profiles] failed to parse cosmetics config ${filePath}:`, err.message);
     }
@@ -71,11 +76,15 @@ function loadCosmeticsRules() {
 
   return {
     rules: FALLBACK_UNLOCK_RULES,
+    validIds: {
+      title: new Set(Object.keys(FALLBACK_UNLOCK_RULES.title)),
+      cardBg: new Set(["default"]),
+    },
     statKeys: new Set(["fish_caught", "kill_villager", "kill_endermite", "kill_silverfish"]),
   };
 }
 
-const { rules: UNLOCK_RULES, statKeys: ALLOWED_STAT_KEYS } = loadCosmeticsRules();
+const { rules: UNLOCK_RULES, validIds: VALID_COSMETIC_IDS, statKeys: ALLOWED_STAT_KEYS } = loadCosmeticsRules();
 export { UNLOCK_RULES };
 
 function parseJsonObject(raw) {
@@ -103,6 +112,11 @@ export function computeLevel(totalXp) {
 
 function isCosmeticUnlocked(unlocks, category, value, level = 0) {
   if (!value) return true;
+  // Whitelist against the known catalog so arbitrary client strings cannot be equipped
+  const validSet = VALID_COSMETIC_IDS[category];
+  if (validSet && !validSet.has(value)) {
+    return false;
+  }
   const categoryRules = UNLOCK_RULES[category];
   if (!categoryRules || !(value in categoryRules)) {
     return true;
@@ -389,7 +403,7 @@ export class ProfileStore {
         const delta = Math.floor(Number(rawVal));
         if (!Number.isFinite(delta) || delta <= 0) continue;
         // Cap single-match delta to prevent bogus/overflow values
-        const clamped = Math.min(delta, 10000);
+        const clamped = Math.min(delta, 200);
         nextStats[key] = (Number(nextStats[key]) || 0) + clamped;
       }
     }

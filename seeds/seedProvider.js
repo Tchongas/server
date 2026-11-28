@@ -97,8 +97,15 @@ export class SeedProvider {
     }
 
     let bucket = null;
-    if (preferredType) {
-      bucket = store.types.find((t) => t.type === preferredType) || null;
+    if (Array.isArray(preferredType) && preferredType.length > 0) {
+      const allowed = new Set(preferredType.map((t) => String(t).trim().toLowerCase()).filter(Boolean));
+      const matching = store.types.filter((t) => allowed.has(t.type.toLowerCase()));
+      if (matching.length > 0) {
+        bucket = matching[randomInt(0, matching.length)];
+      }
+    } else if (typeof preferredType === "string" && preferredType.trim()) {
+      const target = preferredType.trim().toLowerCase();
+      bucket = store.types.find((t) => t.type.toLowerCase() === target) || null;
     }
     if (!bucket) {
       // Uniform across available types for variety
