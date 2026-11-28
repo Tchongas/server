@@ -78,7 +78,7 @@ function loadCosmeticsRules() {
     rules: FALLBACK_UNLOCK_RULES,
     validIds: {
       title: new Set(Object.keys(FALLBACK_UNLOCK_RULES.title)),
-      cardBg: new Set(["default"]),
+      cardBg: null, // Do not reject new client cardBg IDs if server cosmetics.json is absent
     },
     statKeys: new Set(["fish_caught", "kill_villager", "kill_endermite", "kill_silverfish"]),
   };
@@ -112,10 +112,18 @@ export function computeLevel(totalXp) {
 
 function isCosmeticUnlocked(unlocks, category, value, level = 0) {
   if (!value) return true;
-  // Whitelist against the known catalog so arbitrary client strings cannot be equipped
-  const validSet = VALID_COSMETIC_IDS[category];
-  if (validSet && !validSet.has(value)) {
-    return false;
+  if (category === "cardBg") {
+    // Allow any safe ID format so new client backgrounds aren't rejected before server config sync,
+    // while still enforcing unlock rules below if the ID has one.
+    if (!/^[a-zA-Z0-9_-]{1,32}$/.test(value)) {
+      return false;
+    }
+  } else {
+    // Whitelist titles against the known catalog so arbitrary client strings cannot be equipped
+    const validSet = VALID_COSMETIC_IDS[category];
+    if (validSet && !validSet.has(value)) {
+      return false;
+    }
   }
   const categoryRules = UNLOCK_RULES[category];
   if (!categoryRules || !(value in categoryRules)) {

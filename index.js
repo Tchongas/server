@@ -1182,7 +1182,12 @@ wss.on("connection", (ws, req) => {
       if (match.results.has(session.uuid)) return;
       // Reject finishes before the synchronized countdown has actually started the match
       if (match.startedAt <= 0 || Date.now() < match.startedAt) return;
-      const elapsed = Math.max(0, Date.now() - match.startedAt);
+      const rtaMs = Math.max(0, Date.now() - match.startedAt);
+      const rawIgt = Number(msg.finishTime);
+      // Use player's IGT (clamped to [0, rtaMs + 2000] so it cannot exceed real elapsed time)
+      const elapsed = Number.isFinite(rawIgt) && rawIgt >= 0
+        ? Math.min(Math.floor(rawIgt), rtaMs + 2000)
+        : rtaMs;
 
       const rawScore = Number.isFinite(Number(msg.score)) ? Math.floor(Number(msg.score)) : 0;
       const score = match.scoreMode ? Math.max(0, Math.min(500, rawScore)) : -1;
