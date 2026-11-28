@@ -198,6 +198,12 @@ const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_WS_PER_IP = 5;
 const HTTP_RATE_WINDOW_MS = 60 * 1000;
 const COUNTDOWN_SECONDS = 5;
+const LOBBY_WAIT_MS = 15000;
+const LOBBY_LOCK_REMAINING_MS = 6000;
+const LOBBY_FULL_WAIT_MS = 3000;
+const MIN_MATCH_PLAYERS = 2;
+const MAX_MATCH_PLAYERS = 6;
+const MAX_ROOM_PLAYERS = 8;
 const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 // In-memory state (no DB, no ELO, no match history)
@@ -205,10 +211,63 @@ const sessionsByToken = new Map(); // resumeToken -> Session
 const sessionsByUuid = new Map();  // uuid -> Session (prevents duplicate logins / self-matchmaking)
 const wsCountByIp = new Map();     // ip -> active WS count
 const httpRateByIp = new Map();    // ip:bucket -> { start, count }
-const roomsByCode = new Map();     // code -> Room
+const roomsByCode = new Map();     // code -> Room (both private rooms and public matchmaking lobbies)
 const matchesById = new Map();     // matchId -> Match
 const recentMatchStats = new Map(); // matchId -> { uuids: Set, submitted: Set, expiresAt }
-const queuesByMode = new Map();    // mode -> Set<Session>
+const queuesByMode = new Map();    // mode -> Set<Session> (legacy/unused once lobbies are active)
+
+function findOpenPublicLobby(mode, uuid) {
+  const now = Date.now();
+  let best = null;
+  for (const room of roomsByCode.values()) {
+    if (!room.publicLobby || room.mode !== mode) continue;
+    if (room.players.length >= MAX_MATCH_PLAYERS) continue;
+    // Lock the lobby once 6 seconds or fewer remain on its countdown
+    if (room.countdownEndsAt > 0 && room.countdownEndsAt - now <= LOBBY_LOCK_REMAINING_MS) continue;
+    if (room.players.some((p) => p.session.uuid === uuid)) continue;
+    if (!best || room.players.length > best.players.length) {
+      best = room;
+    }
+  }
+  return best;
+}
+
+function updatePublicLobbyTimer(room) {
+  if (!room || !room.publicLobby) return;
+  if (room.players.length < MIN_MATCH_PLAYERS) {
+    if (room.startTimer) {
+      clearTimeout(room.startTimer);
+      room.startTimer = null;
+    }
+    room.countdownEndsAt = 0;
+    return;
+  }
+
+  const now = Date.now();
+  const desiredDelay = room.players.length >= MAX_MATCH_PLAYERS ? LOBBY_FULL_WAIT_MS : LOBBY_WAIT_MS;
+  const remaining = room.countdownEndsAt > now ? room.countdownEndsAt - now : Infinity;
+
+  if (!room.startTimer || desiredDelay < remaining) {
+    if (room.startTimer) clearTimeout(room.startTimer);
+    room.countdownEndsAt = now + desiredDelay;
+    room.startTimer = setTimeout(() => {
+      room.startTimer = null;
+      if (!roomsByCode.has(room.code)) return;
+      if (room.players.length < MIN_MATCH_PLAYERS) {
+        room.countdownEndsAt = 0;
+        broadcastRoom(room);
+        return;
+      }
+      roomsByCode.delete(room.code);
+      const sessions = room.players.map((p) => p.session);
+      for (const s of sessions) {
+        s.roomCode = null;
+        s.queuedMode = null;
+      }
+      startMatch(room.mode, sessions, null);
+    }, desiredDelay);
+  }
+}
 
 function getClientIp(req) {
   const fwd = req?.headers?.["x-forwarded-for"];
@@ -253,9 +312,9 @@ let lastCountsJson = "";
 
 function computeModeCounts() {
   const counts = {};
-  for (const [mode, set] of queuesByMode) {
-    if (set.size > 0) {
-      counts[mode] = (counts[mode] || 0) + set.size;
+  for (const room of roomsByCode.values()) {
+    if (room.publicLobby && room.players.length > 0) {
+      counts[room.mode] = (counts[room.mode] || 0) + room.players.length;
     }
   }
   for (const match of matchesById.values()) {
@@ -346,6 +405,8 @@ function broadcastRoom(room) {
     code: room.code,
     mode: room.mode,
     owner: room.owner,
+    publicLobby: Boolean(room.publicLobby),
+    countdownEndsAt: room.countdownEndsAt || 0,
     players: room.players.map((p) => ({
       name: p.name,
       ready: p.ready,
@@ -361,16 +422,27 @@ function leaveRoom(session) {
   if (!session.roomCode) return;
   const room = roomsByCode.get(session.roomCode);
   session.roomCode = null;
+  session.queuedMode = null;
   if (!room) return;
 
   room.players = room.players.filter((p) => p.session !== session);
   if (room.players.length === 0) {
+    if (room.startTimer) {
+      clearTimeout(room.startTimer);
+      room.startTimer = null;
+    }
     roomsByCode.delete(room.code);
   } else {
     if (room.owner === session.name) {
       room.owner = room.players[0].name;
     }
+    if (room.publicLobby) {
+      updatePublicLobbyTimer(room);
+    }
     broadcastRoom(room);
+  }
+  if (room.publicLobby) {
+    scheduleModeCountsBroadcast();
   }
 }
 
@@ -896,7 +968,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // --- Matchmaking Queue ---
+    // --- Matchmaking Queue (Open Public Lobbies: min 2, max 6, auto-start countdown) ---
     if (type === "queue_join") {
       const mode = typeof msg.mode === "string" && msg.mode.trim() ? msg.mode.trim() : "time_trial";
       if (!MODE_FLAGS.has(mode)) {
@@ -905,40 +977,35 @@ wss.on("connection", (ws, req) => {
       }
       leaveRoom(session);
       leaveQueue(session, false);
-      let set = queuesByMode.get(mode);
-      if (!set) {
-        set = new Set();
-        queuesByMode.set(mode, set);
-      }
-      set.add(session);
-      session.queuedMode = mode;
-      send(ws, { type: "queue_state", inQueue: true, queueSize: set.size, mode });
-      scheduleModeCountsBroadcast();
 
-      if (set.size >= 2) {
-        const pair = [];
-        const seenUuids = new Set();
-        for (const s of set) {
-          if (seenUuids.has(s.uuid)) continue;
-          seenUuids.add(s.uuid);
-          pair.push(s);
-          if (pair.length === 2) break;
-        }
-        if (pair.length === 2) {
-          for (const s of pair) {
-            set.delete(s);
-            s.queuedMode = null;
-            send(s.ws, { type: "queue_state", inQueue: false, queueSize: 0, mode: "" });
-          }
-          if (set.size === 0) queuesByMode.delete(mode);
-          startMatch(mode, pair, null);
-        }
+      let lobby = findOpenPublicLobby(mode, session.uuid);
+      if (!lobby) {
+        const code = generateRoomCode();
+        lobby = {
+          code,
+          mode,
+          owner: "",
+          publicLobby: true,
+          countdownEndsAt: 0,
+          startTimer: null,
+          players: [],
+        };
+        roomsByCode.set(code, lobby);
       }
+
+      lobby.players.push({ session, name: session.name, ready: false });
+      session.roomCode = lobby.code;
+      session.queuedMode = mode;
+      updatePublicLobbyTimer(lobby);
+      broadcastRoom(lobby);
+      scheduleModeCountsBroadcast();
+      console.log(`[lobby] ${session.name} joined public ${mode} lobby ${lobby.code} (${lobby.players.length}/${MAX_MATCH_PLAYERS})`);
       return;
     }
 
     if (type === "queue_leave") {
       leaveQueue(session, true);
+      leaveRoom(session);
       return;
     }
 
@@ -975,7 +1042,7 @@ wss.on("connection", (ws, req) => {
         broadcastRoom(room);
         return;
       }
-      if (room.players.length >= 2) {
+      if (room.players.length >= MAX_ROOM_PLAYERS) {
         sendError(ws, "room_full", "Room is full.");
         return;
       }
